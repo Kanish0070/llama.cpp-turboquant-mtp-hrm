@@ -1,33 +1,16 @@
-
-
 # Atomic llama.cpp (HRM Patch Edition)
-
-
 
 ![atomic llama](https://github.com/AtomicBot-ai/.github/raw/main/assets/atomic%20llama.png)
 
-
-
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-
-
 
 **This repository is a specialized fork that introduces native Hierarchical Reasoning Model (HRM) architecture support and structural GGUF tensor mapping, built on top of the AtomicChat TurboQuant/MTP inference engine.**
 
-
-
 ---
-
-
 
 ## 🚀 Fork Contributions: Native HRM Architecture Integration
 
-
-
-While this repository is built on top of high-performance speculative and quantization forks, **the core contribution of this fork is the manual integration and architectural enablement of the HRM (Hierarchical Reasoning Model) pipeline inside the C++ runtime layer.** Instead of treating HRM like a standard causal transformer, this patch updates the GGUF script converters, header constants, and graph compilers to correctly map and execute macro-recurrent network states.
-
-
-
+While this repository is built on top of high-performance speculative and quantization forks, **the core contribution of this fork is the manual integration and architectural enablement of the HRM (Hierarchical Reasoning Model) pipeline inside the C++ runtime layer.** Instead of treating HRM like a standard causal transformer, this patch builds upon the baseline [sinimiini/HRM-Text-1B-GGUF Patch File](https://huggingface.co/sinimiini/HRM-Text-1B-GGUF/tree/main/runtime) to update the GGUF script converters, header constants, and graph compilers to correctly map and execute macro-recurrent network states.
 
 
 
