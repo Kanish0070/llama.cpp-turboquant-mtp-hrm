@@ -17,6 +17,13 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct llama_model_base {
+    virtual ~llama_model_base() = default;
+
+    virtual void load_arch_hparams(llama_model_loader & ml) = 0;
+    virtual void load_arch_tensors(llama_model_loader & ml) = 0;
+    virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
+};
 
 // available models
 enum llm_type {
@@ -535,6 +542,9 @@ struct llama_model {
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
+	
+	struct ggml_tensor * hrm_z_l_init = nullptr;
+    struct ggml_tensor * output_s     = nullptr;
 
     // classifier
     struct ggml_tensor * cls       = nullptr;

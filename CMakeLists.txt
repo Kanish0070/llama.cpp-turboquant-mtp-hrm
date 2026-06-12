@@ -2,6 +2,11 @@ cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit 
 project("llama.cpp" C CXX)
 include(CheckIncludeFileCXX)
 
+if (CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
+    # Suppress warning #221: floating-point value does not fit in required floating-point type
+    add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe=--diag_suppress=221>")
+endif()
+
 #set(CMAKE_WARN_DEPRECATED YES)
 set(CMAKE_WARN_UNUSED_CLI YES)
 

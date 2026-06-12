@@ -1,0 +1,556 @@
+diff --git a/conversion/__init__.py b/conversion/__init__.py
+index 2c38123df..ecf1be2db 100644
+--- a/conversion/__init__.py
++++ b/conversion/__init__.py
+@@ -95,6 +95,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
+     "HunYuanDenseV1ForCausalLM": "hunyuan",
+     "HunYuanMoEV1ForCausalLM": "hunyuan",
+     "HunYuanVLForConditionalGeneration": "hunyuan",
++    "HrmTextForCausalLM": "hrm_text",
+     "IQuestCoderForCausalLM": "llama",
+     "InternLM2ForCausalLM": "internlm",
+     "InternLM3ForCausalLM": "internlm",
+diff --git a/conversion/hrm_text.py b/conversion/hrm_text.py
+new file mode 100644
+index 000000000..1f29ab55e
+--- /dev/null
++++ b/conversion/hrm_text.py
+@@ -0,0 +1,120 @@
++from __future__ import annotations
++
++import re
++import json
++
++from typing import Iterable, TYPE_CHECKING
++
++import torch
++
++if TYPE_CHECKING:
++    from torch import Tensor
++
++from .base import ModelBase, TextModel, gguf, logger
++
++
++@ModelBase.register("HrmTextForCausalLM")
++class HrmTextModel(TextModel):
++    model_arch = gguf.MODEL_ARCH.HRM_TEXT
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++
++        with open(self.dir_model / "config.json", "r", encoding="utf-8") as f:
++            self.raw_hparams = json.load(f)
++
++        self.layers_per_stack = self.raw_hparams["num_hidden_layers"]
++        self.h_cycles = self.raw_hparams["H_cycles"]
++        self.l_cycles = self.raw_hparams["L_cycles"]
++        self.physical_block_count = self.layers_per_stack * 2
++        self.cache_block_count = self.layers_per_stack * self.h_cycles * (self.l_cycles + 1)
++
++        # GGUF tensors store one physical L stack followed by one physical H stack.
++        # The runtime expands these 32 physical layers across 128 KV-cache slots.
++        self.block_count = self.physical_block_count
++        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
++
++    def set_vocab(self):
++        # HRM-Text ships a Qwen2-style tokenizer.json. Keep it as a plain tokenizer;
++        # do not add a chat template for validation GGUFs.
++        self._set_vocab_gpt2()
++
++    def get_vocab_base_pre(self, tokenizer) -> str:
++        del tokenizer
++        return "qwen2"
++
++    def set_gguf_parameters(self):
++        hp = self.raw_hparams
++        head_dim = hp["head_dim"]
++
++        self.gguf_writer.add_context_length(hp["max_position_embeddings"])
++        self.gguf_writer.add_embedding_length(hp["hidden_size"])
++        self.gguf_writer.add_block_count(self.cache_block_count)
++        self.gguf_writer.add_feed_forward_length(hp["intermediate_size"])
++        self.gguf_writer.add_head_count(hp["num_attention_heads"])
++        self.gguf_writer.add_head_count_kv(hp["num_key_value_heads"])
++        self.gguf_writer.add_key_length(head_dim)
++        self.gguf_writer.add_value_length(head_dim)
++        self.gguf_writer.add_rope_dimension_count(head_dim)
++        self.gguf_writer.add_rope_freq_base(hp.get("rope_theta", 10000.0))
++        self.gguf_writer.add_layer_norm_rms_eps(hp["rms_norm_eps"])
++        self.gguf_writer.add_embedding_scale(hp["embedding_scale"])
++
++        arch = self.gguf_writer.arch
++        self.gguf_writer.add_uint32(gguf.Keys.LLM.HRM_LAYERS_PER_STACK.format(arch=arch), self.layers_per_stack)
++        self.gguf_writer.add_uint32(gguf.Keys.LLM.HRM_H_CYCLES.format(arch=arch), self.h_cycles)
++        self.gguf_writer.add_uint32(gguf.Keys.LLM.HRM_L_CYCLES.format(arch=arch), self.l_cycles)
++        self.gguf_writer.add_bool(gguf.Keys.LLM.HRM_PREFIX_LM.format(arch=arch), bool(hp.get("prefix_lm", False)))
++
++    def _format(self, key: gguf.MODEL_TENSOR, bid: int | None = None, suffix: str = ".weight") -> str:
++        return self.format_tensor_name(key, bid=bid, suffix=suffix)
++
++    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
++        if name == "model.embed_tokens.weight":
++            yield self._format(gguf.MODEL_TENSOR.TOKEN_EMBD), data_torch
++            return
++
++        if name == "lm_head.weight":
++            yield self._format(gguf.MODEL_TENSOR.OUTPUT), data_torch
++            return
++
++        if name == "model.z_L_init":
++            yield self._format(gguf.MODEL_TENSOR.HRM_Z_L_INIT, suffix=""), data_torch
++            return
++
++        match = re.fullmatch(r"model\.([LH])_module\.layers\.(\d+)\.(.+)", name)
++        if match is None:
++            raise ValueError(f"Can not map tensor {name!r}")
++
++        stack, layer_s, tensor_name = match.groups()
++        layer_idx = int(layer_s)
++        if layer_idx >= self.layers_per_stack:
++            raise ValueError(f"Layer index {layer_idx} outside HRM stack size {self.layers_per_stack}")
++
++        physical_bid = layer_idx + (self.layers_per_stack if stack == "H" else 0)
++
++        if tensor_name == "attn.gqkv_proj.weight":
++            gate, q, k, v = torch.chunk(data_torch, 4, dim=0)
++            logger.debug("Split %s as gate, q, k, v", name)
++            yield self._format(gguf.MODEL_TENSOR.ATTN_GATE, physical_bid), gate.contiguous()
++            yield self._format(gguf.MODEL_TENSOR.ATTN_Q, physical_bid), q.contiguous()
++            yield self._format(gguf.MODEL_TENSOR.ATTN_K, physical_bid), k.contiguous()
++            yield self._format(gguf.MODEL_TENSOR.ATTN_V, physical_bid), v.contiguous()
++            return
++
++        if tensor_name == "attn.o_proj.weight":
++            yield self._format(gguf.MODEL_TENSOR.ATTN_OUT, physical_bid), data_torch
++            return
++
++        if tensor_name == "mlp.gate_up_proj.weight":
++            gate, up = torch.chunk(data_torch, 2, dim=0)
++            logger.debug("Split %s as gate, up", name)
++            yield self._format(gguf.MODEL_TENSOR.FFN_GATE, physical_bid), gate.contiguous()
++            yield self._format(gguf.MODEL_TENSOR.FFN_UP, physical_bid), up.contiguous()
++            return
++
++        if tensor_name == "mlp.down_proj.weight":
++            yield self._format(gguf.MODEL_TENSOR.FFN_DOWN, physical_bid), data_torch
++            return
++
++        raise ValueError(f"Can not map tensor {name!r}")
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index 7fdcf03d7..b84cc8827 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -144,6 +144,10 @@ class Keys:
+         TOKEN_SHIFT_COUNT                 = "{arch}.token_shift_count"
+         INTERLEAVE_MOE_LAYER_STEP         = "{arch}.interleave_moe_layer_step"
+         FULL_ATTENTION_INTERVAL           = "{arch}.full_attention_interval"
++        HRM_LAYERS_PER_STACK              = "{arch}.layers_per_stack"
++        HRM_H_CYCLES                      = "{arch}.h_cycles"
++        HRM_L_CYCLES                      = "{arch}.l_cycles"
++        HRM_PREFIX_LM                     = "{arch}.prefix_lm"
+         ACTIVATION_SPARSITY_SCALE         = "{arch}.activation_sparsity_scale"
+         ALTUP_ACTIVE_IDX                  = "{arch}.altup.active_idx"
+         ALTUP_NUM_INPUTS                  = "{arch}.altup.num_inputs"
+@@ -410,6 +414,7 @@ class MODEL_ARCH(IntEnum):
+     QWEN3            = auto()
+     QWEN3MOE         = auto()
+     QWEN3NEXT        = auto()
++    HRM_TEXT         = auto()
+     QWEN3VL          = auto()
+     QWEN3VLMOE       = auto()
+     QWEN35           = auto()
+@@ -527,6 +532,7 @@ class MODEL_TENSOR(IntEnum):
+     TOKEN_TYPES          = auto()
+     POS_EMBD             = auto()
+     OUTPUT               = auto()
++    HRM_Z_L_INIT         = auto()
+     DENSE_2_OUT          = auto() # embeddinggemma 2_Dense
+     DENSE_3_OUT          = auto() # embeddinggemma 3_Dense
+     OUTPUT_NORM          = auto()
+@@ -925,6 +931,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
+     MODEL_ARCH.QWEN3:            "qwen3",
+     MODEL_ARCH.QWEN3MOE:         "qwen3moe",
+     MODEL_ARCH.QWEN3NEXT:        "qwen3next",
++    MODEL_ARCH.HRM_TEXT:         "hrm_text",
+     MODEL_ARCH.QWEN3VL:          "qwen3vl",
+     MODEL_ARCH.QWEN3VLMOE:       "qwen3vlmoe",
+     MODEL_ARCH.QWEN35:           "qwen35",
+@@ -1042,6 +1049,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
+     MODEL_TENSOR.POS_EMBD:                  "position_embd",
+     MODEL_TENSOR.OUTPUT_NORM:               "output_norm",
+     MODEL_TENSOR.OUTPUT:                    "output",
++    MODEL_TENSOR.HRM_Z_L_INIT:              "hrm.z_l_init",
+     MODEL_TENSOR.DENSE_2_OUT:                "dense_2", # embeddinggemma 2_Dense
+     MODEL_TENSOR.DENSE_3_OUT:                "dense_3", # embeddinggemma 2_Dense
+     MODEL_TENSOR.ROPE_FREQS:                "rope_freqs",
+@@ -2057,6 +2065,19 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+         MODEL_TENSOR.SSM_BETA_ALPHA,
+         MODEL_TENSOR.SSM_OUT
+     ],
++    MODEL_ARCH.HRM_TEXT: [
++        MODEL_TENSOR.TOKEN_EMBD,
++        MODEL_TENSOR.OUTPUT,
++        MODEL_TENSOR.HRM_Z_L_INIT,
++        MODEL_TENSOR.ATTN_Q,
++        MODEL_TENSOR.ATTN_K,
++        MODEL_TENSOR.ATTN_V,
++        MODEL_TENSOR.ATTN_GATE,
++        MODEL_TENSOR.ATTN_OUT,
++        MODEL_TENSOR.FFN_GATE,
++        MODEL_TENSOR.FFN_DOWN,
++        MODEL_TENSOR.FFN_UP,
++    ],
+     MODEL_ARCH.QWEN3VL: [
+         MODEL_TENSOR.TOKEN_EMBD,
+         MODEL_TENSOR.OUTPUT_NORM,
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index c9eead18a..5b8ee3781 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -37,6 +37,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
+     { LLM_ARCH_QWEN3,            "qwen3"            },
+     { LLM_ARCH_QWEN3MOE,         "qwen3moe"         },
+     { LLM_ARCH_QWEN3NEXT,        "qwen3next"        },
++    { LLM_ARCH_HRM_TEXT,         "hrm_text"         },
+     { LLM_ARCH_QWEN3VL,          "qwen3vl"          },
+     { LLM_ARCH_QWEN3VLMOE,       "qwen3vlmoe"       },
+     { LLM_ARCH_QWEN35,           "qwen35"           },
+@@ -209,6 +210,10 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
+     { LLM_KV_TOKEN_SHIFT_COUNT,                 "%s.token_shift_count"                 },
+     { LLM_KV_INTERLEAVE_MOE_LAYER_STEP,         "%s.interleave_moe_layer_step"         },
+     { LLM_KV_FULL_ATTENTION_INTERVAL,           "%s.full_attention_interval"           },
++    { LLM_KV_HRM_LAYERS_PER_STACK,              "%s.layers_per_stack"                  },
++    { LLM_KV_HRM_H_CYCLES,                      "%s.h_cycles"                          },
++    { LLM_KV_HRM_L_CYCLES,                      "%s.l_cycles"                          },
++    { LLM_KV_HRM_PREFIX_LM,                     "%s.prefix_lm"                         },
+ 
+     { LLM_KV_ATTENTION_HEAD_COUNT,                   "%s.attention.head_count"                   },
+     { LLM_KV_ATTENTION_HEAD_COUNT_KV,                "%s.attention.head_count_kv"                },
+@@ -346,6 +351,7 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_OUTPUT_NORM,                            "output_norm" },
+     { LLM_TENSOR_OUTPUT_NORM_LFM2,                       "token_embd_norm" }, // fix for wrong tensor name
+     { LLM_TENSOR_OUTPUT,                                 "output" },
++    { LLM_TENSOR_HRM_Z_L_INIT,                           "hrm.z_l_init" },
+     { LLM_TENSOR_ROPE_FREQS,                             "rope_freqs" },
+     { LLM_TENSOR_ATTN_NORM,                              "blk.%d.attn_norm" },
+     { LLM_TENSOR_ATTN_Q,                                 "blk.%d.attn_q" },
+@@ -565,6 +571,7 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_POS_EMBD,                   {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
+     {LLM_TENSOR_TOKEN_TYPES,                {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
+     {LLM_TENSOR_TOKEN_EMBD_NORM,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},  // do the norms on the first layer (not the input layer)
++    {LLM_TENSOR_HRM_Z_L_INIT,               {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL}},
+     {LLM_TENSOR_OUTPUT,                     {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_CLS,                        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_CLS_OUT,                    {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index 89cf16cc3..fa04b684b 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -41,6 +41,7 @@ enum llm_arch {
+     LLM_ARCH_QWEN3,
+     LLM_ARCH_QWEN3MOE,
+     LLM_ARCH_QWEN3NEXT,
++    LLM_ARCH_HRM_TEXT,
+     LLM_ARCH_QWEN3VL,
+     LLM_ARCH_QWEN3VLMOE,
+     LLM_ARCH_QWEN35,
+@@ -213,6 +214,10 @@ enum llm_kv {
+     LLM_KV_TOKEN_SHIFT_COUNT,
+     LLM_KV_INTERLEAVE_MOE_LAYER_STEP,
+     LLM_KV_FULL_ATTENTION_INTERVAL,
++    LLM_KV_HRM_LAYERS_PER_STACK,
++    LLM_KV_HRM_H_CYCLES,
++    LLM_KV_HRM_L_CYCLES,
++    LLM_KV_HRM_PREFIX_LM,
+ 
+     LLM_KV_ATTENTION_HEAD_COUNT,
+     LLM_KV_ATTENTION_HEAD_COUNT_KV,
+@@ -354,6 +359,7 @@ enum llm_tensor {
+     LLM_TENSOR_DENSE_2_OUT,
+     LLM_TENSOR_DENSE_3_OUT,
+     LLM_TENSOR_OUTPUT,
++    LLM_TENSOR_HRM_Z_L_INIT,
+     LLM_TENSOR_OUTPUT_NORM,
+     LLM_TENSOR_OUTPUT_NORM_LFM2, // fix for wrong tensor name
+     LLM_TENSOR_ROPE_FREQS,
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index ad36c0666..fa80f4260 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2208,6 +2208,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+     if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
+         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+     }
++    if (model.arch == LLM_ARCH_HRM_TEXT) {
++        return std::max<uint32_t>(n_tokens * 80, 64u * model.n_tensors());
++    }
+     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+     for (const auto & lora : model.loras) {
+         res += lora->get_n_nodes();
+diff --git a/src/llama-hparams.h b/src/llama-hparams.h
+index e2d051edc..812598f69 100644
+--- a/src/llama-hparams.h
++++ b/src/llama-hparams.h
+@@ -164,6 +164,12 @@ struct llama_hparams {
+     float f_embedding_scale = 0.0f;
+     float f_attention_scale = 0.0f;
+ 
++    // HRM-Text recurrence metadata. n_layer remains the expanded KV-cache slot count.
++    uint32_t n_hrm_layer_per_stack = 0;
++    uint32_t n_hrm_h_cycles        = 0;
++    uint32_t n_hrm_l_cycles        = 0;
++    bool     hrm_prefix_lm         = false;
++
+     // grok-2
+     float    f_attn_out_scale = 0.0f;
+     uint32_t attn_temp_length = 0;
+diff --git a/src/llama-model-saver.cpp b/src/llama-model-saver.cpp
+index 528e4c9c0..8a6e009c6 100644
+--- a/src/llama-model-saver.cpp
++++ b/src/llama-model-saver.cpp
+@@ -245,6 +245,10 @@ void llama_model_saver::add_kv_from_model() {
+     add_kv(LLM_KV_TOKEN_SHIFT_COUNT,                 hparams.token_shift_count);
+     add_kv(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,         hparams.n_moe_layer_step);
+     // add_kv(LLM_KV_FULL_ATTENTION_INTERVAL,           ???);
++    add_kv(LLM_KV_HRM_LAYERS_PER_STACK,              hparams.n_hrm_layer_per_stack);
++    add_kv(LLM_KV_HRM_H_CYCLES,                      hparams.n_hrm_h_cycles);
++    add_kv(LLM_KV_HRM_L_CYCLES,                      hparams.n_hrm_l_cycles);
++    add_kv(LLM_KV_HRM_PREFIX_LM,                     hparams.hrm_prefix_lm);
+ 
+     add_kv(LLM_KV_ATTENTION_HEAD_COUNT,              hparams.n_head_arr, true);
+     add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV,           hparams.n_head_kv_arr, true);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 8bf20a716..a3cc996aa 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -96,6 +96,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+             return new llama_model_qwen2moe(params);
+         case LLM_ARCH_QWEN3:
+             return new llama_model_qwen3(params);
++        case LLM_ARCH_HRM_TEXT:
++            return new llama_model_hrm_text(params);
+         case LLM_ARCH_QWEN3MOE:
+             return new llama_model_qwen3moe(params);
+         case LLM_ARCH_QWEN3VL:
+@@ -2339,6 +2341,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+         case LLM_ARCH_PANGU_EMBED:
+         case LLM_ARCH_AFMOE:
+         case LLM_ARCH_QWEN3NEXT:
++        case LLM_ARCH_HRM_TEXT:
+         case LLM_ARCH_MIMO2:
+         case LLM_ARCH_STEP35:
+             return LLAMA_ROPE_TYPE_NEOX;
+diff --git a/src/models/hrm-text.cpp b/src/models/hrm-text.cpp
+new file mode 100644
+index 000000000..e0a3e9f59
+--- /dev/null
++++ b/src/models/hrm-text.cpp
+@@ -0,0 +1,183 @@
++#include "models.h"
++
++#include <cmath>
++#include <vector>
++
++void llama_model_hrm_text::load_arch_hparams(llama_model_loader & ml) {
++    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
++    ml.get_key(LLM_KV_EMBEDDING_SCALE,             hparams.f_embedding_scale);
++    ml.get_key(LLM_KV_HRM_LAYERS_PER_STACK,        hparams.n_hrm_layer_per_stack);
++    ml.get_key(LLM_KV_HRM_H_CYCLES,                hparams.n_hrm_h_cycles);
++    ml.get_key(LLM_KV_HRM_L_CYCLES,                hparams.n_hrm_l_cycles);
++    ml.get_key(LLM_KV_HRM_PREFIX_LM,               hparams.hrm_prefix_lm, false);
++
++    switch (hparams.n_embd) {
++        case 1536: type = LLM_TYPE_1B; break;
++        default:   type = LLM_TYPE_UNKNOWN;
++    }
++}
++
++void llama_model_hrm_text::load_arch_tensors(llama_model_loader &) {
++    LLAMA_LOAD_LOCALS;
++
++    const int64_t n_stack = hparams.n_hrm_layer_per_stack;
++    const int64_t n_cycle_slots = n_stack * (hparams.n_hrm_l_cycles + 1);
++
++    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
++    output   = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), {n_embd, n_vocab}, 0);
++
++    hrm_z_l_init = create_tensor(tn(LLM_TENSOR_HRM_Z_L_INIT), {n_embd}, 0);
++
++    std::vector<bool> loaded_physical(2 * n_stack, false);
++
++    for (int il = 0; il < n_layer; ++il) {
++        auto & layer = layers[il];
++
++        const int64_t layer_in_stack = il % n_stack;
++        const int64_t phase = (il % n_cycle_slots) / n_stack;
++        const bool is_h_stack = phase == int64_t(hparams.n_hrm_l_cycles);
++        const int physical_bid = int((is_h_stack ? n_stack : 0) + layer_in_stack);
++
++        const int flags = loaded_physical[physical_bid] ? TENSOR_DUPLICATED : 0;
++        loaded_physical[physical_bid] = true;
++
++        create_tensor_qkv(layer, physical_bid,
++                n_embd,
++                n_embd_head_k * n_head,
++                n_embd_k_gqa,
++                n_embd_v_gqa,
++                flags);
++
++        layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", physical_bid), {n_embd, n_embd_head_k * n_head}, flags);
++        layer.wo        = create_tensor(tn(LLM_TENSOR_ATTN_OUT,  "weight", physical_bid), {n_embd_head_k * n_head, n_embd}, flags);
++
++        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", physical_bid), {n_embd, n_ff}, flags);
++        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", physical_bid), {n_ff, n_embd}, flags);
++        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", physical_bid), {n_embd, n_ff}, flags);
++    }
++}
++
++std::unique_ptr<llm_graph_context> llama_model_hrm_text::build_arch_graph(const llm_graph_params & params) const {
++    return std::make_unique<graph>(*this, params);
++}
++
++llama_model_hrm_text::graph::graph(const llama_model & model_, const llm_graph_params & params) : llm_graph_context(params) {
++    const auto & model = static_cast<const llama_model_hrm_text &>(model_);
++
++    GGML_ASSERT(model.tok_embd != nullptr);
++    GGML_ASSERT(model.output != nullptr);
++    GGML_ASSERT(model.hrm_z_l_init != nullptr);
++
++    const int64_t n_embd_head = hparams.n_embd_head_v();
++    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
++    GGML_ASSERT(n_embd_head == n_rot);
++
++    const int64_t n_stack = hparams.n_hrm_layer_per_stack;
++    const int64_t h_cycles = hparams.n_hrm_h_cycles;
++    const int64_t l_cycles = hparams.n_hrm_l_cycles;
++
++    ggml_tensor * inp_pos = build_inp_pos();
++    auto * inp_attn = build_attn_inp_kv();
++    ggml_tensor * inp_out_ids = build_inp_out_ids();
++
++    ggml_tensor * hidden_high = build_inp_embd(model.tok_embd);
++    ggml_tensor * hidden_low = ggml_repeat(ctx0, model.hrm_z_l_init, hidden_high);
++    cb(hidden_low, "hrm_z_l_init", -1);
++
++    const float kq_scale = 1.0f / std::sqrt(float(n_embd_head));
++
++    auto build_stack = [&](ggml_tensor * stack_inp, int slot_offset) -> ggml_tensor * {
++        ggml_tensor * stack_cur = stack_inp;
++
++        for (int layer_idx = 0; layer_idx < n_stack; ++layer_idx) {
++            const int il = slot_offset + layer_idx;
++            const auto & layer = model.layers[il];
++
++            ggml_tensor * inpSA = stack_cur;
++            ggml_tensor * cur = build_norm(stack_cur, nullptr, nullptr, LLM_NORM_RMS, il);
++            cb(cur, "attn_norm", il);
++
++            {
++                ggml_tensor * attn_inp = cur;
++                auto [Qcur, Kcur, Vcur] = build_qkv(layer, cur, n_embd_head, n_head, n_head_kv, il);
++
++                ggml_tensor * gate = build_lora_mm(layer.wqkv_gate, attn_inp, layer.wqkv_gate_s);
++                cb(gate, "attn_gate_proj", il);
++
++                Qcur = ggml_rope_ext(
++                        ctx0, Qcur, inp_pos, nullptr,
++                        n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++                        ext_factor, attn_factor, beta_fast, beta_slow);
++                cb(Qcur, "Qcur_rope", il);
++
++                Kcur = ggml_rope_ext(
++                        ctx0, Kcur, inp_pos, nullptr,
++                        n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++                        ext_factor, attn_factor, beta_fast, beta_slow);
++                cb(Kcur, "Kcur_rope", il);
++
++                cur = build_attn(inp_attn,
++                        nullptr, nullptr, nullptr,
++                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
++                cb(cur, "attn_out", il);
++
++                gate = ggml_sigmoid(ctx0, gate);
++                cb(gate, "attn_gate_sig", il);
++
++                cur = ggml_mul(ctx0, cur, gate);
++                cb(cur, "attn_gated", il);
++
++                cur = build_lora_mm(layer.wo, cur, layer.wo_s);
++                cb(cur, "attn_o_proj", il);
++            }
++
++            ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
++            cb(ffn_inp, "ffn_inp", il);
++
++            cur = build_norm(ffn_inp, nullptr, nullptr, LLM_NORM_RMS, il);
++            cb(cur, "ffn_norm", il);
++
++            cur = build_ffn(cur,
++                    layer.ffn_up,   nullptr, layer.ffn_up_s,
++                    layer.ffn_gate, nullptr, layer.ffn_gate_s,
++                    layer.ffn_down, nullptr, layer.ffn_down_s,
++                    nullptr,
++                    LLM_FFN_SILU, LLM_FFN_PAR, il);
++            cb(cur, "ffn_out", il);
++
++            cur = ggml_add(ctx0, cur, ffn_inp);
++            cur = build_cvec(cur, il);
++            cb(cur, "hrm_layer_out", il);
++
++            stack_cur = cur;
++        }
++
++        stack_cur = build_norm(stack_cur, nullptr, nullptr, LLM_NORM_RMS, slot_offset);
++        cb(stack_cur, "stack_final_norm", slot_offset);
++        return stack_cur;
++    };
++
++    for (int h = 0; h < h_cycles; ++h) {
++        for (int l = 0; l < l_cycles; ++l) {
++            const int slot_offset = int((h * (l_cycles + 1) + l) * n_stack);
++            hidden_low = build_stack(ggml_add(ctx0, hidden_low, hidden_high), slot_offset);
++        }
++
++        const int slot_offset = int((h * (l_cycles + 1) + l_cycles) * n_stack);
++        hidden_high = build_stack(ggml_add(ctx0, hidden_high, hidden_low), slot_offset);
++    }
++
++    ggml_tensor * cur = hidden_high;
++
++    if (inp_out_ids) {
++        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++    }
++
++    res->t_embd = cur;
++
++    cur = build_lora_mm(model.output, cur, model.output_s);
++    cb(cur, "result_output", -1);
++
++    res->t_logits = cur;
++    ggml_build_forward_expand(gf, cur);
++}
+diff --git a/src/models/models.h b/src/models/models.h
+index 7e551eb96..7da6b7f7f 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -515,6 +515,20 @@ struct llama_model_qwen3 : public llama_model_base {
+     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+ };
+ 
++struct llama_model_hrm_text : public llama_model_base {
++    llama_model_hrm_text(const struct llama_model_params & params) : llama_model_base(params) {}
++    void load_arch_hparams(llama_model_loader & ml) override;
++    void load_arch_tensors(llama_model_loader & ml) override;
++
++    ggml_tensor * hrm_z_l_init = nullptr;
++
++    struct graph : public llm_graph_context {
++        graph(const llama_model & model, const llm_graph_params & params);
++    };
++
++    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
++};
++
+ 
+ struct llama_model_qwen3moe : public llama_model_base {
+     llama_model_qwen3moe(const struct llama_model_params & params) : llama_model_base(params) {}

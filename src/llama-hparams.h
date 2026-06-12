@@ -164,6 +164,12 @@ struct llama_hparams {
     float f_embedding_scale = 0.0f;
     float f_attention_scale = 0.0f;
 
+    // HRM-Text recurrence metadata. n_layer remains the expanded KV-cache slot count.
+    uint32_t n_hrm_layer_per_stack = 0;
+    uint32_t n_hrm_h_cycles        = 0;
+    uint32_t n_hrm_l_cycles        = 0;
+    bool     hrm_prefix_lm         = false;
+
     // grok-2
     float    f_attn_out_scale = 0.0f;
     uint32_t attn_temp_length = 0;

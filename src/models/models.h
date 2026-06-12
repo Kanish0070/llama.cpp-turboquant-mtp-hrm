@@ -357,6 +357,10 @@ struct llm_build_grovemoe : public llm_graph_context {
     llm_build_grovemoe(const llama_model & model, const llm_graph_params & params);
 };
 
+struct llm_build_hrm_text : public llm_graph_context {
+    llm_build_hrm_text(const llama_model & model, const llm_graph_params & params);
+};
+
 struct llm_build_hunyuan_dense : public llm_graph_context {
     llm_build_hunyuan_dense(const llama_model & model, const llm_graph_params & params);
 };
@@ -554,6 +558,20 @@ struct llm_build_qwen2vl : public llm_graph_context {
 
 struct llm_build_qwen3 : public llm_graph_context {
     llm_build_qwen3(const llama_model & model, const llm_graph_params & params);
+};
+
+struct llama_model_hrm_text : public llama_model_base {
+    llama_model_hrm_text(const struct llama_model_params & params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    ggml_tensor * hrm_z_l_init = nullptr;
+
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
 struct llm_build_qwen3moe : public llm_graph_context {

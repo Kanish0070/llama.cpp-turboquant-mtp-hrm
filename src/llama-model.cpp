@@ -14,6 +14,7 @@
 #include "llama-memory-recurrent.h"
 
 #include "models/models.h"
+#include "models/hrm-text.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -1334,6 +1335,20 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     case 40: type = LLM_TYPE_14B; break;
                     case 64: type = LLM_TYPE_32B; break;
                     default: type = LLM_TYPE_UNKNOWN;
+                }
+            } break;
+		case LLM_ARCH_HRM_TEXT:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_EMBEDDING_SCALE,             hparams.f_embedding_scale);
+                ml.get_key(LLM_KV_HRM_LAYERS_PER_STACK,        hparams.n_hrm_layer_per_stack);
+                ml.get_key(LLM_KV_HRM_H_CYCLES,                hparams.n_hrm_h_cycles);
+                ml.get_key(LLM_KV_HRM_L_CYCLES,                hparams.n_hrm_l_cycles);
+                ml.get_key(LLM_KV_HRM_PREFIX_LM,               hparams.hrm_prefix_lm, false);
+
+                switch (hparams.n_embd) {
+                    case 1536: type = LLM_TYPE_1B; break;
+                    default:   type = LLM_TYPE_UNKNOWN;
                 }
             } break;
         case LLM_ARCH_MAINCODER:
@@ -6790,6 +6805,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                                         layer.norm   = create_tensor(tn(LLM_TENSOR_POS_NET_ATTN_NORM, "weight", i), {1, n_embd}, 0);
                                         layer.norm_b = create_tensor(tn(LLM_TENSOR_POS_NET_ATTN_NORM, "bias",   i), {1, n_embd}, 0);
                                     } break;
+								
                                 default: GGML_ABORT("unknown posnet layer");
                             };
                         }
@@ -8239,6 +8255,39 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
                     }
                 } break;
+				
+			case LLM_ARCH_HRM_TEXT:
+                {
+                    tok_embd     = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+                    hrm_z_l_init = create_tensor(tn(LLM_TENSOR_HRM_Z_L_INIT, nullptr), {n_embd}, 0);
+
+                    // Output projections
+                    output       = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+                    if (output == NULL) {
+                        output   = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+                    }
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+                        
+                        const int pi = i % 32; 
+                        const int flags = (i >= 32) ? TENSOR_DUPLICATED : 0;
+
+                        // Attention matrices (Fully using pi and flags)
+                        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", pi), {n_embd, n_embd_head_k * n_head}, flags);
+                        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", pi), {n_embd, n_embd_gqa}, flags);
+                        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", pi), {n_embd, n_embd_gqa}, flags);
+                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", pi), {n_embd_head_k * n_head, n_embd}, flags);
+
+                        // HRM-specific gate parameter allocation
+                        layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", pi), {n_embd, n_embd}, flags);
+
+                        // Feed-forward block definitions
+                        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", pi), {n_embd,   n_ff}, flags);
+                        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", pi), {  n_ff, n_embd}, flags);
+                        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", pi), {n_embd,   n_ff}, flags);
+                    }
+                } break;
             default:
                 throw std::runtime_error("unknown architecture");
         }
@@ -9149,6 +9198,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
         case LLM_ARCH_QWEN3MOE:
             {
                 llm = std::make_unique<llm_build_qwen3moe>(*this, params);
+            } break;
+		case LLM_ARCH_HRM_TEXT:
+            {
+                llm = std::make_unique<llama_model_hrm_text::graph>(*this, params);
             } break;
         case LLM_ARCH_QWEN3VL:
             {
