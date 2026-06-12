@@ -28,55 +28,6 @@ While this repository is built on top of high-performance speculative and quanti
 
 
 
-### 1. GGUF Parameter & Tensor Registration
-
-* **Metadata Registration:** Updated `conversion/hrm_text.py` and `gguf-py` constants to natively register the `MODEL_ARCH.HRM_TEXT` enum type.
-
-* **Hparams Handling:** The engine natively extracts HRM-specific variables (`layers_per_stack`, `H_cycles`, and `L_cycles`) right out of the GGUF header file to compute expanded runtime KV-cache slots.
-
-* **Tensor Split Mapping:** Configured proper splitting and contiguous memory handling for custom model keys like `model.z_L_init`, `attn.gqkv_proj.weight` (chunked into gate, Q, K, and V), and gated MLP layers.
-
-
-
-### 2. Workspace Node Optimization (`graph_max_nodes`)
-
-* Because of the loop-unrolling and state dependencies inside an HRM graph, node memory demands scale much higher than normal models. 
-
-* Patched `llama-context.cpp` to automatically allocate a worst-case threshold of **$n\_tokens \times 80$** (or $64 \times \text{total tensors}$) whenever an `LLM_ARCH_HRM_TEXT` model footprint is detected, preventing early scratchpad memory exhaustion and runtime segmentation faults.
-
-
-
-### 3. Recurrent Graph Execution Block
-
-* Implemented the core initialization mechanics inside `src/models/hrm-text.cpp` to structurally deploy the macro-recurrent looping framework across $H$ and $L$ cycles, routing states cleanly through the tensor layout:
-
-
-
-```cpp
-
-for (int h = 0; h < h_cycles; ++h) {
-
-    for (int l = 0; l < l_cycles; ++l) {
-
-        const int slot_offset = int((h * (l_cycles + 1) + l) * n_stack);
-
-        hidden_low = build_stack(ggml_add(ctx0, hidden_low, hidden_high), slot_offset);
-
-    }
-
-    const int slot_offset = int((h * (l_cycles + 1) + l_cycles) * n_stack);
-
-    hidden_high = build_stack(ggml_add(ctx0, hidden_high, hidden_low), slot_offset);
-
-}
-
-
-
-```
-
-
-
----
 
 
 
