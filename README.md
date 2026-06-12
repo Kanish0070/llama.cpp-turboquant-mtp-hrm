@@ -1,4 +1,4 @@
-```markdown
+
 
 # Atomic llama.cpp (HRM Patch Edition)
 
